@@ -6,6 +6,7 @@ export interface Marcador {
   id: string
   salaId: number
   usuarioId: number
+  creadorId: number
   latitud: number
   longitud: number
   tipo: TipoMarcador

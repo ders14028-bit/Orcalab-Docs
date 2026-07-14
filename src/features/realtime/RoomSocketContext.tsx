@@ -14,6 +14,7 @@ import { useNavigate } from 'react-router-dom'
 import { API_BASE } from '../../lib/apiBase'
 import { useAuth } from '../auth/AuthContext'
 import { useRooms } from '../rooms/RoomsContext'
+import { useVoiceCall } from '../voice/useVoiceCall'
 import * as historyApi from './historyApi'
 import * as canalesApi from '../channels/api'
 import * as roomsApi from '../rooms/api'
@@ -43,6 +44,16 @@ function elegirCanalPorDefecto(canales: Canal[]): string | null {
   return texto?.id ?? canales[0]?.id ?? null
 }
 
+interface EstadoLlamadaVoz {
+  canalVozActivoId: string | null
+  muteado: boolean
+  streamsRemotos: Record<number, MediaStream>
+  error: string | null
+  unirse: (canalId: string) => void
+  salir: () => void
+  alternarMute: () => void
+}
+
 interface RoomSocketValue {
   salaId: number
   estado: EstadoConexion
@@ -65,6 +76,7 @@ interface RoomSocketValue {
   eliminarCanal: (canalId: string) => Promise<void>
   enviarMensaje: (contenido: string, marcadorId?: string) => void
   enviarMarcador: (payload: MarcadorRequest) => void
+  eliminarMarcador: (marcadorId: string) => Promise<void>
   moverCursor: (x: number, y: number) => void
   descartarToast: (alertaId: string) => void
   quitarPresenteLocal: (usuarioId: number) => void
@@ -79,6 +91,8 @@ interface RoomSocketValue {
   enviarRespuestaVoz: (canalId: string, paraUsuarioId: number, sdp: string) => void
   enviarIceVoz: (canalId: string, paraUsuarioId: number, candidato: RTCIceCandidateInit) => void
   suscribirSenalVoz: (handler: (mensaje: VozSenalMensaje) => void) => () => void
+  /** Estado de la llamada de voz, independiente de canalActivoId (ver useVoiceCall). */
+  voz: EstadoLlamadaVoz
 }
 
 const RoomSocketContext = createContext<RoomSocketValue | undefined>(undefined)
@@ -91,6 +105,15 @@ export function RoomSocketProvider({ salaId, children }: { salaId: number; child
   const navigate = useNavigate()
   const clientRef = useRef<Client | null>(null)
   const ultimoCursorEnviado = useRef(0)
+
+  // DIAG-CURSOR (temporal, quitar tras el diagnóstico): ver moverCursor (envío) y la suscripción
+  // a /cursores (llegada) más abajo.
+  const diagEmisorUltimo = useRef(0)
+  const diagEmisorStats = useRef({ n: 0, suma: 0, min: Infinity, max: 0 })
+  const diagEmisorResumen = useRef(performance.now())
+  const diagReceptorUltimo = useRef(0)
+  const diagReceptorStats = useRef({ n: 0, suma: 0, min: Infinity, max: 0, deltas: [] as number[] })
+  const diagReceptorResumen = useRef(performance.now())
 
   // El handler de presencia se registra una sola vez al conectar (ver más abajo) y su closure
   // quedaría con el "salas" de ese momento — casi seguro `[]`, porque RoomsProvider todavía no
@@ -271,6 +294,11 @@ export function RoomSocketProvider({ salaId, children }: { salaId: number; child
         })
       })
 
+      client.subscribe(`/topic/sala/${salaId}/marcadores/eliminado`, (message: IMessage) => {
+        const data = JSON.parse(message.body) as { marcadorId: string }
+        setMarcadores((prev) => prev.filter((m) => m.id !== data.marcadorId))
+      })
+
       client.subscribe(`/topic/sala/${salaId}/alertas`, (message: IMessage) => {
         const alerta = JSON.parse(message.body) as Alerta
         setAlertas((prev) => [alerta, ...prev])
@@ -280,6 +308,32 @@ export function RoomSocketProvider({ salaId, children }: { salaId: number; child
       client.subscribe(`/topic/sala/${salaId}/cursores`, (message: IMessage) => {
         const cursor = JSON.parse(message.body) as CursorMensaje
         if (cursor.usuarioId === auth.usuarioId) return
+
+        // DIAG-CURSOR (temporal, quitar tras el diagnóstico): intervalo REAL entre llegadas
+        // consecutivas de posición de cursor, ya después de navegador emisor -> Kong ->
+        // realtime-service -> Kong -> este navegador. Se listan los deltas individuales (no solo
+        // promedio) para poder ver ráfagas seguidas de huecos, indicativo de buffering/jitter en
+        // algún punto de la cadena en vez de un problema del throttle en sí.
+        const ahoraDiag = performance.now()
+        if (diagReceptorUltimo.current) {
+          const dt = ahoraDiag - diagReceptorUltimo.current
+          const s = diagReceptorStats.current
+          s.n++
+          s.suma += dt
+          s.min = Math.min(s.min, dt)
+          s.max = Math.max(s.max, dt)
+          s.deltas.push(Math.round(dt))
+        }
+        diagReceptorUltimo.current = ahoraDiag
+        if (ahoraDiag - diagReceptorResumen.current > 2000 && diagReceptorStats.current.n > 0) {
+          const s = diagReceptorStats.current
+          console.log(
+            `[DIAG-CURSOR receptor:llegada] n=${s.n} avg=${(s.suma / s.n).toFixed(1)}ms min=${s.min.toFixed(1)}ms max=${s.max.toFixed(1)}ms deltas=[${s.deltas.join(',')}]`,
+          )
+          diagReceptorStats.current = { n: 0, suma: 0, min: Infinity, max: 0, deltas: [] }
+          diagReceptorResumen.current = ahoraDiag
+        }
+
         setCursores((prev) => ({
           ...prev,
           [cursor.usuarioId]: { x: cursor.x, y: cursor.y, actualizado: Date.now() },
@@ -386,12 +440,18 @@ export function RoomSocketProvider({ salaId, children }: { salaId: number; child
 
   // Si el canal eliminado era el activo, cae al canal por defecto disponible; se usa tanto para
   // la acción local del líder como para el broadcast que reciben los demás clientes conectados.
+  // Si además era el canal de la llamada de voz en curso, cuelga: el backend no puede forzar la
+  // desconexión de un RTCPeerConnection (vive solo en el navegador), así que cada cliente
+  // conectado a esa llamada debe colgar por su cuenta al recibir este mismo evento.
   const quitarCanalDelEstado = useCallback((canalId: string) => {
     setCanales((prev) => {
       const siguiente = prev.filter((c) => c.id !== canalId)
       setCanalActivoId((actual) => (actual === canalId ? elegirCanalPorDefecto(siguiente) : actual))
       return siguiente
     })
+    if (vozRef.current.canalVozActivoId === canalId) {
+      vozRef.current.salir()
+    }
   }, [])
 
   const crearCanal = useCallback(
@@ -432,11 +492,45 @@ export function RoomSocketProvider({ salaId, children }: { salaId: number; child
     [salaId],
   )
 
+  // REST (no WebSocket como enviarMarcador): la verificación de "es líder" del backend necesita
+  // el JWT crudo de la petición HTTP, no disponible en un handler de STOMP. Ver comentario en
+  // MapaHistorialController.eliminarMarcador.
+  const eliminarMarcador = useCallback(
+    async (marcadorId: string) => {
+      await historyApi.eliminarMarcador(salaId, marcadorId)
+      setMarcadores((prev) => prev.filter((m) => m.id !== marcadorId))
+    },
+    [salaId],
+  )
+
   const moverCursor = useCallback(
     (x: number, y: number) => {
       const ahora = Date.now()
       if (ahora - ultimoCursorEnviado.current < CURSOR_THROTTLE_MS) return
       ultimoCursorEnviado.current = ahora
+
+      // DIAG-CURSOR (temporal, quitar tras el diagnóstico): frecuencia REAL de envío ya pasado el
+      // throttle (lo que efectivamente sale por el socket), para descartar que el propio throttle
+      // o el evento mousemove nativo sean el cuello de botella antes de mirar la red/backend.
+      const ahoraDiag = performance.now()
+      if (diagEmisorUltimo.current) {
+        const dt = ahoraDiag - diagEmisorUltimo.current
+        const s = diagEmisorStats.current
+        s.n++
+        s.suma += dt
+        s.min = Math.min(s.min, dt)
+        s.max = Math.max(s.max, dt)
+      }
+      diagEmisorUltimo.current = ahoraDiag
+      if (ahoraDiag - diagEmisorResumen.current > 2000 && diagEmisorStats.current.n > 0) {
+        const s = diagEmisorStats.current
+        console.log(
+          `[DIAG-CURSOR emisor:publish tras throttle] n=${s.n} avg=${(s.suma / s.n).toFixed(1)}ms min=${s.min.toFixed(1)}ms max=${s.max.toFixed(1)}ms`,
+        )
+        diagEmisorStats.current = { n: 0, suma: 0, min: Infinity, max: 0 }
+        diagEmisorResumen.current = ahoraDiag
+      }
+
       clientRef.current?.publish({
         destination: `/app/sala/${salaId}/cursor`,
         body: JSON.stringify({ x, y }),
@@ -526,6 +620,26 @@ export function RoomSocketProvider({ salaId, children }: { salaId: number; child
     }
   }, [])
 
+  // Se llama una sola vez aquí (vida = sala, vía RoomSocketProvider keyed por salaId en
+  // RoomShellLayout), no desde VoiceChannelPanel (vida = canal que se está viendo): así
+  // navegar entre canales de texto no cuelga la llamada de voz en curso.
+  const voz = useVoiceCall({
+    usuarioId: auth?.usuarioId,
+    participantesVozPorCanal,
+    entrarVoz,
+    salirVoz,
+    silenciarVoz,
+    enviarOfertaVoz,
+    enviarRespuestaVoz,
+    enviarIceVoz,
+    suscribirSenalVoz,
+  })
+
+  // Espejo de `voz` legible desde quitarCanalDelEstado (declarado antes que `voz` en este
+  // archivo) sin forzar su recreación en cada render — ver ese callback para el porqué.
+  const vozRef = useRef(voz)
+  vozRef.current = voz
+
   const refetchMiembros = useCallback(async () => {
     try {
       const data = await roomsApi.listarMiembros(salaId)
@@ -569,6 +683,7 @@ export function RoomSocketProvider({ salaId, children }: { salaId: number; child
       eliminarCanal,
       enviarMensaje,
       enviarMarcador,
+      eliminarMarcador,
       moverCursor,
       descartarToast,
       quitarPresenteLocal,
@@ -583,6 +698,7 @@ export function RoomSocketProvider({ salaId, children }: { salaId: number; child
       enviarRespuestaVoz,
       enviarIceVoz,
       suscribirSenalVoz,
+      voz,
     }),
     [
       salaId,
@@ -606,6 +722,7 @@ export function RoomSocketProvider({ salaId, children }: { salaId: number; child
       eliminarCanal,
       enviarMensaje,
       enviarMarcador,
+      eliminarMarcador,
       moverCursor,
       descartarToast,
       quitarPresenteLocal,
@@ -620,6 +737,7 @@ export function RoomSocketProvider({ salaId, children }: { salaId: number; child
       enviarRespuestaVoz,
       enviarIceVoz,
       suscribirSenalVoz,
+      voz,
     ],
   )
 

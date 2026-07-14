@@ -2,8 +2,10 @@ import { Layers, Waves } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { MapContainer, Marker, Popup, TileLayer, WMSTileLayer, useMap, useMapEvents } from 'react-leaflet'
 import type { LatLng } from 'leaflet'
+import { useAuth } from '../auth/AuthContext'
 import { useRoomSocket } from '../realtime/RoomSocketContext'
 import { useNombreUsuario } from '../users/useNombreUsuario'
+import { ConfirmModal } from '../../components/ui/ConfirmModal'
 import { crearIconoMarcador, ETIQUETA_TIPO } from './markerIcon'
 import { MarkerFormModal, type MarkerDraft } from './MarkerFormModal'
 import { CursorLayer } from './CursorLayer'
@@ -66,7 +68,38 @@ function RastreadorCursor() {
 
   useEffect(() => {
     const contenedor = map.getContainer()
+
+    // DIAG-CURSOR (temporal, quitar tras el diagnóstico): frecuencia REAL con la que el
+    // navegador dispara el evento nativo mousemove, antes de nuestro throttle. Si el navegador ya
+    // los agrupa/limita internamente (tab en background, carga de CPU, etc.), se vería aquí.
+    let diagUltimo = 0
+    let diagN = 0
+    let diagSuma = 0
+    let diagMin = Infinity
+    let diagMax = 0
+    let diagResumen = performance.now()
+
     function onMouseMove(e: MouseEvent) {
+      const ahoraDiag = performance.now()
+      if (diagUltimo) {
+        const dt = ahoraDiag - diagUltimo
+        diagN++
+        diagSuma += dt
+        diagMin = Math.min(diagMin, dt)
+        diagMax = Math.max(diagMax, dt)
+      }
+      diagUltimo = ahoraDiag
+      if (ahoraDiag - diagResumen > 2000 && diagN > 0) {
+        console.log(
+          `[DIAG-CURSOR emisor:mousemove nativo] n=${diagN} avg=${(diagSuma / diagN).toFixed(1)}ms min=${diagMin.toFixed(1)}ms max=${diagMax.toFixed(1)}ms`,
+        )
+        diagN = 0
+        diagSuma = 0
+        diagMin = Infinity
+        diagMax = 0
+        diagResumen = ahoraDiag
+      }
+
       const rect = contenedor.getBoundingClientRect()
       const x = ((e.clientX - rect.left) / rect.width) * 100
       const y = ((e.clientY - rect.top) / rect.height) * 100
@@ -80,8 +113,19 @@ function RastreadorCursor() {
   return null
 }
 
-function PopupMarcador({ marcador, onEditar }: { marcador: Marcador; onEditar: () => void }) {
+function PopupMarcador({
+  marcador,
+  onEditar,
+  onEliminar,
+}: {
+  marcador: Marcador
+  onEditar: () => void
+  onEliminar: () => void
+}) {
   const nombreAutor = useNombreUsuario(marcador.usuarioId)
+  const { auth } = useAuth()
+  const { soyLider } = useRoomSocket()
+  const puedeEliminar = auth?.usuarioId === marcador.creadorId || soyLider
 
   return (
     <div className="min-w-40 text-sm">
@@ -90,21 +134,33 @@ function PopupMarcador({ marcador, onEditar }: { marcador: Marcador; onEditar: (
       <p className="mt-2 text-xs text-text-muted">
         {nombreAutor} · {new Date(marcador.fechaUltimaEdicion).toLocaleString()}
       </p>
-      <button
-        type="button"
-        onClick={onEditar}
-        className="mt-2 text-xs font-medium text-primary hover:underline cursor-pointer"
-      >
-        Editar
-      </button>
+      <div className="mt-2 flex items-center gap-3">
+        <button
+          type="button"
+          onClick={onEditar}
+          className="text-xs font-medium text-primary hover:underline cursor-pointer"
+        >
+          Editar
+        </button>
+        {puedeEliminar && (
+          <button
+            type="button"
+            onClick={onEliminar}
+            className="text-xs font-medium text-danger hover:underline cursor-pointer"
+          >
+            Eliminar
+          </button>
+        )}
+      </div>
     </div>
   )
 }
 
 export function MapView() {
-  const { marcadores, enviarMarcador } = useRoomSocket()
+  const { marcadores, enviarMarcador, eliminarMarcador } = useRoomSocket()
   const [draft, setDraft] = useState<MarkerDraft | null>(null)
   const [capaBase, setCapaBase] = useState<CapaBase>('calles')
+  const [marcadorAEliminar, setMarcadorAEliminar] = useState<Marcador | null>(null)
 
   function handleConfirm(tipo: TipoMarcador, descripcion: string) {
     if (!draft) return
@@ -151,6 +207,7 @@ export function MapView() {
                 onEditar={() =>
                   setDraft({ latlng: { lat: marcador.latitud, lng: marcador.longitud }, marcador })
                 }
+                onEliminar={() => setMarcadorAEliminar(marcador)}
               />
             </Popup>
           </Marker>
@@ -162,6 +219,18 @@ export function MapView() {
       <ToggleCapaBase capa={capaBase} onChange={setCapaBase} />
 
       <MarkerFormModal draft={draft} onClose={() => setDraft(null)} onConfirm={handleConfirm} />
+
+      <ConfirmModal
+        open={marcadorAEliminar !== null}
+        title="Eliminar marcador"
+        message={`¿Seguro que quieres eliminar este marcador${marcadorAEliminar?.descripcion ? ` («${marcadorAEliminar.descripcion}»)` : ''}? Esta acción no se puede deshacer.`}
+        confirmLabel="Eliminar"
+        danger
+        onConfirm={async () => {
+          if (marcadorAEliminar) await eliminarMarcador(marcadorAEliminar.id)
+        }}
+        onClose={() => setMarcadorAEliminar(null)}
+      />
     </div>
   )
 }

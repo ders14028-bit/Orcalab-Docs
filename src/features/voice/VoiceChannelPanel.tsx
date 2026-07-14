@@ -1,9 +1,7 @@
 import { Mic, MicOff, PhoneCall, PhoneOff } from 'lucide-react'
-import { useEffect, useRef } from 'react'
 import { useAuth } from '../auth/AuthContext'
 import { useRoomSocket } from '../realtime/RoomSocketContext'
 import { useNombreUsuario } from '../users/useNombreUsuario'
-import { useVoiceCall } from './useVoiceCall'
 import type { Canal } from '../../types/room'
 
 function FilaParticipante({
@@ -32,22 +30,13 @@ function FilaParticipante({
   )
 }
 
-function AudioRemoto({ stream }: { stream: MediaStream }) {
-  const audioRef = useRef<HTMLAudioElement>(null)
-
-  useEffect(() => {
-    if (audioRef.current) audioRef.current.srcObject = stream
-  }, [stream])
-
-  return <audio ref={audioRef} autoPlay />
-}
-
 export function VoiceChannelPanel({ canal }: { canal: Canal }) {
   const { auth } = useAuth()
-  const { participantesVozPorCanal } = useRoomSocket()
-  const { unido, muteado, streamsRemotos, error, unirse, salir, alternarMute } = useVoiceCall(canal.id)
+  const { participantesVozPorCanal, voz } = useRoomSocket()
 
   const participantes = participantesVozPorCanal[canal.id] ?? []
+  const conectadoAEsteCanal = voz.canalVozActivoId === canal.id
+  const conectadoAOtroCanal = voz.canalVozActivoId !== null && !conectadoAEsteCanal
 
   return (
     <div className="flex h-full min-w-0 flex-col items-center justify-center gap-4 px-3 py-6">
@@ -71,33 +60,33 @@ export function VoiceChannelPanel({ canal }: { canal: Canal }) {
         </ul>
       )}
 
-      {error && <p className="text-xs text-danger">{error}</p>}
+      {voz.error && <p className="text-xs text-danger">{voz.error}</p>}
 
-      {!unido ? (
+      {!conectadoAEsteCanal ? (
         <button
           type="button"
-          onClick={unirse}
+          onClick={() => voz.unirse(canal.id)}
           className="flex items-center gap-2 rounded-control bg-primary px-4 py-2 text-sm font-medium text-white
             hover:bg-primary-hover cursor-pointer"
         >
           <PhoneCall className="h-4 w-4" aria-hidden="true" />
-          Unirse a la llamada
+          {conectadoAOtroCanal ? 'Cambiar a esta llamada' : 'Unirse a la llamada'}
         </button>
       ) : (
         <div className="flex items-center gap-2">
           <button
             type="button"
-            onClick={alternarMute}
-            title={muteado ? 'Activar micrófono' : 'Silenciar micrófono'}
-            aria-label={muteado ? 'Activar micrófono' : 'Silenciar micrófono'}
+            onClick={voz.alternarMute}
+            title={voz.muteado ? 'Activar micrófono' : 'Silenciar micrófono'}
+            aria-label={voz.muteado ? 'Activar micrófono' : 'Silenciar micrófono'}
             className="flex h-10 w-10 items-center justify-center rounded-control bg-surface text-text
               hover:bg-surface-hover cursor-pointer"
           >
-            {muteado ? <MicOff className="h-4 w-4" aria-hidden="true" /> : <Mic className="h-4 w-4" aria-hidden="true" />}
+            {voz.muteado ? <MicOff className="h-4 w-4" aria-hidden="true" /> : <Mic className="h-4 w-4" aria-hidden="true" />}
           </button>
           <button
             type="button"
-            onClick={salir}
+            onClick={voz.salir}
             title="Salir de la llamada"
             aria-label="Salir de la llamada"
             className="flex h-10 w-10 items-center justify-center rounded-control bg-danger text-white
@@ -107,10 +96,6 @@ export function VoiceChannelPanel({ canal }: { canal: Canal }) {
           </button>
         </div>
       )}
-
-      {Object.entries(streamsRemotos).map(([usuarioId, stream]) => (
-        <AudioRemoto key={usuarioId} stream={stream} />
-      ))}
     </div>
   )
 }

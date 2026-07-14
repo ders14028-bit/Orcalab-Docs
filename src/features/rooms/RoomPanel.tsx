@@ -6,6 +6,7 @@ import { FormAlert } from '../../components/ui/FormAlert'
 import { ApiError } from '../../lib/http'
 import { ChannelList } from '../channels/ChannelList'
 import { DeleteRoomModal } from './DeleteRoomModal'
+import { VoiceCallBar } from '../voice/VoiceCallBar'
 import { useRoomSocket } from '../realtime/RoomSocketContext'
 import { useRooms } from './RoomsContext'
 import * as roomsApi from './api'
@@ -179,6 +180,8 @@ export function RoomPanel() {
           </form>
         </div>
       </div>
+
+      {salaActiva && <VoiceCallBar />}
     </aside>
   )
 }

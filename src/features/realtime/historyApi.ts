@@ -9,6 +9,10 @@ export function obtenerMarcadores(salaId: number): Promise<Marcador[]> {
   return apiFetch<Marcador[]>(`/api/salas/${salaId}/marcadores`)
 }
 
+export function eliminarMarcador(salaId: number, marcadorId: string): Promise<void> {
+  return apiFetch<void>(`/api/salas/${salaId}/marcadores/${marcadorId}`, { method: 'DELETE' })
+}
+
 export function obtenerAlertas(salaId: number): Promise<Alerta[]> {
   return apiFetch<Alerta[]>(`/api/salas/${salaId}/alertas`)
 }
