@@ -60,7 +60,28 @@ export function VoiceChannelPanel({ canal }: { canal: Canal }) {
         </ul>
       )}
 
-      {voz.error && <p className="text-xs text-danger">{voz.error}</p>}
+      {voz.dispositivos.length > 0 && (
+        <div className="w-full max-w-xs">
+          <label className="mb-1 block text-xs text-text-muted" htmlFor="selector-microfono">
+            Micrófono
+          </label>
+          <select
+            id="selector-microfono"
+            value={voz.dispositivoId ?? ''}
+            onChange={(e) => voz.seleccionarDispositivo(e.target.value)}
+            className="w-full rounded-control border border-border bg-surface px-2 py-1.5 text-xs text-text cursor-pointer"
+          >
+            {voz.dispositivos.map((d, i) => (
+              <option key={d.deviceId} value={d.deviceId}>
+                {d.label || `Micrófono ${i + 1}`}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
+
+      {voz.avisoMicrofono && <p className="max-w-xs text-center text-xs text-warning">{voz.avisoMicrofono}</p>}
+      {voz.error && <p className="max-w-xs text-center text-xs text-danger">{voz.error}</p>}
 
       {!conectadoAEsteCanal ? (
         <button
